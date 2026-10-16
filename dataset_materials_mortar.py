@@ -9,9 +9,8 @@ import scipy
 import seaborn as sns
 import scipy.stats as statsv
 from scipy.stats import norm, ttest_ind, ttest_1samp, ttest_rel
-import functions.functions as dataset
-from process_dataset.process_dataset import contol1_dataset, materials_params_dataset
-import functions.search_functions as search_fnc
+#import functions.functions as dataset
+#import functions.search_functions as search_fnc
 from matplotlib.ticker import (MultipleLocator, AutoMinorLocator)
 from functions.functions import conver_time_stamp, conver_string_parameter, change_sample_age
 
@@ -70,7 +69,7 @@ def pre_process_dataset(data_frame, casting_age, percentage_outliers1, percentag
             out = id_value.copy()
 
             # ---- FIRST OUTLIER CHECK (50% for all) ----
-            outliers1 = Outliers(out, 0.40)
+            outliers1 = Outliers(out, 0.60)
             if outliers1 and not re.search(r"[A-Z]+BR\d+", id):
                 out = [v for i, v in enumerate(out) if i not in outliers1]
             #print(id, out, len(out))\n",
