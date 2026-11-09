@@ -6,14 +6,14 @@ import pandas as pd
 from scipy.stats import norm
 from functions.functions import conver_time_stamp, conver_string_parameter
 from functions.functions import change_sample_age, pre_process_dataset
+from concrete_validation import check_concrete, load_schedule
 
 
 
-def contol1_dataset(directory: str 
-                    #= r"C:\Users\JessicaMaldo_p3rvdgi\OneDrive - Concretene\Results\Controls 1\Logs\\"
-                    = '/home/jessicamaldonado/OneDrive/Results/Controls 1/Logs/' 
-                    # = '/home/jessicamaldonado/OneDrive/Data/Materials_data_2024/Logs_2024/Trials_2024/'
-                     ):
+def contol1_dataset(
+    directory: str = '/home/jessicamaldonado/OneDrive/Results/Controls 1/Logs/',
+    concrete_schedule=None
+):
     contents = os.listdir(directory)
     files = []
     for item in contents:
@@ -25,7 +25,10 @@ def contol1_dataset(directory: str
     compression_dataset = []
     flexural_dataset = []
     cement_test = []
-    
+
+    if concrete_schedule is None:
+        concrete_schedule = load_schedule()
+
     for i, file in enumerate(files):
         path = directory + file
         time_stamp = conver_time_stamp(file)
@@ -42,6 +45,15 @@ def contol1_dataset(directory: str
         sample_age = conver_string_parameter(lines,9)
         sample_number = conver_string_parameter(lines,21)
         depth = conver_string_parameter(lines,7)
+
+        # Check concrete ID and age before the result is added to the dataset.
+        if re.search(r"Compression \w", test) or re.search(r"Flexural \w", test):
+            concrete_id = f"{id[0]}-{id[1]}"
+            for problem in check_concrete(
+                concrete_id, sample_age, time_stamp[0], concrete_schedule
+            ):
+                print(f"CONCRETE VALIDATION: {file} - {problem}")
+
         try:
             value = float(conver_string_parameter(lines,-1))
             load = conver_string_parameter(lines,-2)
