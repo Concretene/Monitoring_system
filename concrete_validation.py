@@ -1,17 +1,18 @@
 import csv
+import filecmp
 import re
 import shutil
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 
 BASE_DIR = Path(__file__).resolve().parent
-LOGS_DIR = BASE_DIR                      # folder holding the machine .txt logs (override with --logs-dir)
+LOGS_DIR = BASE_DIR                      # folder holding the machine .txt logs
 FLAGS_CSV = BASE_DIR / "concrete_validation_flags.csv"
-FLAGGED_DIR = BASE_DIR / "flagged_files"  # flagged logs are moved here
+FLAGGED_DIR = BASE_DIR / "flagged_files"  # copies of flagged logs 
 
 CALENDAR_FILE = Path(
     "/home/jessicamaldonado/OneDrive/Calendars/Calendar_materials.xlsx"
@@ -25,15 +26,14 @@ AGES = {
     28: "D28",
 }
 
+CHECK_FROM = date(2026, 3, 10)
+YEAR_COLUMN = "data_id_with_year"
 
 
 TEST_KINDS = {
     "compression": {"pattern": r"Compression \w", "expected_samples": 5},
-    "flexural": {"pattern": r"Flexural \w", "expected_samples": None}, #Maybe needed
+    "flexural": {"pattern": r"Flexural \w", "expected_samples": None},
 }
-
-# Only check test dates on/after this day (None = check every date in the calendar).
-COUNT_CHECK_FROM = None  # e.g. date(2026, 1, 1)
 
 ERROR_CODES = {
     "1": "Label error",
@@ -67,12 +67,33 @@ MIN_MATCHING_PARTS = 3
 
 FLAG_HEADER = [
     "Flagged at", "Source file", "Concrete ID", "Age", "Test date",
-    "Error code", "Error type", "Problem", "Moved to",
+    "Error code", "Error type", "Problem", "Copied to",
 ]
 
 
+class Schedule(dict):
+
+    def __init__(self):
+        super().__init__()
+        self.years = {}
+
+
+def casting_year(day, age):
+    try:
+        return (day - timedelta(days=int(age))).year
+    except (OverflowError, ValueError, TypeError):
+        return None
+
+
+def _year_from_cell(value):
+    match = re.search(r"(\d{4})\s*$", str(value if value is not None else ""))
+    if match and 2000 <= int(match.group(1)) <= 2100:
+        return int(match.group(1))
+    return None
+
+
 def load_schedule(calendar_file=CALENDAR_FILE):
-    """Return {(test date, concrete ID): set of ages due} from csv or Excel."""
+    #Return a Schedule
     calendar_file = Path(calendar_file)
 
     if calendar_file.suffix.lower() == ".csv":
@@ -95,11 +116,12 @@ def load_schedule(calendar_file=CALENDAR_FILE):
     if missing:
         raise ValueError(f"Concrete calendar is missing columns: {sorted(missing)}")
 
-    schedule = {}
+    schedule = Schedule()
     for row in rows:
         label = str(row.get("ID-BM") or "").strip().upper()
         if not label or label == "NAN":
             continue
+        row_year = _year_from_cell(row.get(YEAR_COLUMN))
         for age, column in AGES.items():
             value = row.get(column)
             if value is None or str(value).strip().lower() in {"", "nan", "nat"}:
@@ -109,11 +131,13 @@ def load_schedule(calendar_file=CALENDAR_FILE):
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"Invalid {column} date for {label}: {value!r}") from exc
             schedule.setdefault((day, label), set()).add(age)
+            schedule.years[(day, label)] = row_year or casting_year(day, age)
 
     return schedule
 
 
 def classify_test(test_type):
+    #Return 'compression', 'flexural' or None (not a concrete strength test).
     for kind, settings in TEST_KINDS.items():
         if re.search(settings["pattern"], test_type):
             return kind
@@ -121,28 +145,34 @@ def classify_test(test_type):
 
 
 def split_label(label):
-    """Split the label into sections"""
+    #Split e.g. 41-CBTC6D1 into week/formulation/mix/initial/sample, or None.
     match = LABEL_PATTERN.match(str(label or "").strip().upper())
     return match.groupdict() if match else None
 
 
-_index_cache = {"schedule": None, "size": -1, "by_day": {}, "by_label": {}}
+_index_cache = {"schedule": None, "size": -1, "by_day": {}, "by_label": {}, "by_label_year": {}}
 
 
 def _index(schedule):
-    """Lookups by test day and by label, rebuilt only when the schedule changes."""
+    #Lookups by test day, by label, and by (label, casting year)
     cache = _index_cache
     if cache["schedule"] is not schedule or cache["size"] != len(schedule):
-        by_day, by_label = {}, {}
+        by_day, by_label, by_label_year = {}, {}, {}
+        years = getattr(schedule, "years", {})
         for (day, label), ages in schedule.items():
             by_day.setdefault(day, {})[label] = ages
             by_label.setdefault(label, {})[day] = ages
-        cache.update(schedule=schedule, size=len(schedule), by_day=by_day, by_label=by_label)
-    return cache["by_day"], cache["by_label"]
+            year = years.get((day, label)) or casting_year(day, min(ages))
+            by_label_year.setdefault((label, year), {})[day] = ages
+        cache.update(
+            schedule=schedule, size=len(schedule),
+            by_day=by_day, by_label=by_label, by_label_year=by_label_year,
+        )
+    return cache["by_day"], cache["by_label"], cache["by_label_year"]
 
 
 def closest_labels(parts, pool):
-
+    """Calendar labels in pool sharing the most parts with the log's label."""
     best_score, best = 0, []
     for candidate in sorted(pool):
         cand_parts = split_label(candidate)
@@ -157,8 +187,6 @@ def closest_labels(parts, pool):
 
 
 def diagnose_concrete(label, age, test_date, schedule):
-    #Return [(error code, plain-English problem)]
-    
     problems = []
     label = str(label or "").strip().upper()
 
@@ -171,6 +199,10 @@ def diagnose_concrete(label, age, test_date, schedule):
             day = datetime.strptime(str(test_date).strip(), "%d/%m/%Y").date()
         except ValueError:
             day = None
+
+    # Before the calendar existed there is nothing to check against.
+    if day is not None and CHECK_FROM and day < CHECK_FROM:
+        return []
 
     if day is None:
         problems.append(("", "No usable test date"))
@@ -187,28 +219,37 @@ def diagnose_concrete(label, age, test_date, schedule):
     if day is None or not label:
         return problems
 
-    by_day, by_label = _index(schedule)
+    by_day, by_label, by_label_year = _index(schedule)
     due_today = by_day.get(day, {})
 
-    if label in by_label:
-        expected_ages = due_today.get(label)
-        if expected_ages is None:
-            due = "; ".join(
-                f"{a} days on {d:%d/%m/%Y}"
-                for d, ages in sorted(by_label[label].items())
-                for a in sorted(ages)
-            )
-            problems.append((
-                "2", f"{label} is not due for testing on {day:%d/%m/%Y} (it is due at {due})"
-            ))
-        elif number_age is not None and number_age not in expected_ages:
+    # Week numbers restart every January, so a label only counts as "in the
+    # calendar" for the year it was cast in (test date minus age). If the age is
+    # unusable, any year will do.
+    cast_year = casting_year(day, number_age) if number_age is not None else None
+
+    # A label that is due on this date can only have an age problem.
+    if label in due_today:
+        expected_ages = due_today[label]
+        if number_age is not None and number_age not in expected_ages:
             ages_text = "/".join(str(a) for a in sorted(expected_ages))
             problems.append((
                 "2", f"Age is {number_age} days, but {label} is due at {ages_text} days on {day:%d/%m/%Y}"
             ))
         return problems
 
-    # Label is not in the calendar at all.
+    label_dates = by_label_year.get((label, cast_year)) if cast_year else by_label.get(label)
+    if label_dates:
+        due = "; ".join(
+            f"{a} days on {d:%d/%m/%Y}"
+            for d, ages in sorted(label_dates.items())
+            for a in sorted(ages)
+        )
+        problems.append((
+            "2", f"{label} is not due for testing on {day:%d/%m/%Y} (it is due at {due})"
+        ))
+        return problems
+
+    where = f" for casting year {cast_year}" if cast_year else ""
     parts = split_label(label)
     if parts is None:
         problems.append((
@@ -243,10 +284,10 @@ def diagnose_concrete(label, age, test_date, schedule):
 
     if not any(code.startswith("1") for code, _ in problems):
         if score >= MIN_MATCHING_PARTS:
-            problems.append(("1", f"{label} is not in the calendar (closest: {names})"))
+            problems.append(("1", f"{label} is not in the calendar{where} (closest: {names})"))
         else:
             problems.append((
-                "1", f"{label} is not in the calendar and no close match is due on {day:%d/%m/%Y}"
+                "1", f"{label} is not in the calendar{where} and no close match is due on {day:%d/%m/%Y}"
             ))
     return problems
 
@@ -260,8 +301,8 @@ def check_concrete(label, age, test_date, schedule):
 
 
 def check_sample_counts(counts, schedule, today=None):
-    #Compare valid logs per (formualton, date, label, age) with each kind's expected_samples.
-
+    #Compare valid logs
+    
     today = today or date.today()
     issues = []
     for kind, settings in TEST_KINDS.items():
@@ -269,7 +310,7 @@ def check_sample_counts(counts, schedule, today=None):
         if expected is None:
             continue
         for (day, label), ages in sorted(schedule.items()):
-            if day > today or (COUNT_CHECK_FROM and day < COUNT_CHECK_FROM):
+            if day > today or (CHECK_FROM and day < CHECK_FROM):
                 continue
             for age in sorted(ages):
                 found = counts.get((kind, day, label, age), 0)
@@ -285,27 +326,30 @@ def check_sample_counts(counts, schedule, today=None):
     return issues
 
 
-def move_to_flagged(path):
-    """Move a flagged log into flagged_files and return where it went."""
+def copy_to_flagged(path):
+    #Copy a flagged log into flagged_files; the original is left where it is.
     try:
         FLAGGED_DIR.mkdir(parents=True, exist_ok=True)
-        target = FLAGGED_DIR / path.name
-        n = 1
-        while target.exists():
-            target = FLAGGED_DIR / f"{path.stem}_{n}{path.suffix}"
+        n = 0
+        while True:
+            name = path.name if n == 0 else f"{path.stem}_{n}{path.suffix}"
+            target = FLAGGED_DIR / name
+            if not target.exists():
+                shutil.copy2(path, target)
+                return str(target)
+            if filecmp.cmp(path, target, shallow=False):
+                return str(target)
             n += 1
-        shutil.move(str(path), str(target))
-        return str(target)
     except OSError as exc:
-        return f"NOT MOVED: {exc}"
+        return f"NOT COPIED: {exc}"
 
 
 def _dedupe_key(row):
-    return (str(row[2]), str(row[3]), str(row[4]), str(row[7]))  # label, age, date, problem
+    # Everything except the time of the run and where the copy is.
+    return tuple(str(row[i]) for i in (1, 2, 3, 4, 5, 7))
 
 
 def write_flags(flags, output_file):
-    """Append new flags to the csv (kept as a history, since flagged files are moved away)."""
     output_file = Path(output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -321,15 +365,19 @@ def write_flags(flags, output_file):
             output_file.rename(output_file.with_name(f"{output_file.stem}_old_{stamp}{output_file.suffix}"))
 
     new_file = not output_file.exists()
+    written = []
     with output_file.open("a", newline="", encoding="utf-8-sig") as stream:
         writer = csv.writer(stream)
         if new_file:
             writer.writerow(FLAG_HEADER)
         for row in flags:
-            # Count problems have no source file; don't repeat identical ones on every run.
-            if not row[1] and _dedupe_key(row) in seen:
+            key = _dedupe_key(row)
+            if key in seen:
                 continue
+            seen.add(key)
             writer.writerow(row)
+            written.append(row)
+    return written
 
 
 def machine_value(lines, index):
@@ -338,41 +386,57 @@ def machine_value(lines, index):
     return lines[index].split("=", 1)[1].strip().strip('"').strip()
 
 
+def log_date_from_name(name):
+    """Test date from a machine log filename like 02_11_2026_09_36_45.592_Last test.txt."""
+    match = re.match(r"^(\d{2})_(\d{2})_(\d{4})_", name)
+    if not match:
+        return None
+    day, month, year = map(int, match.groups())
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
 def check_local_logs(logs_dir=LOGS_DIR):
-    """Validate concrete logs before they are processed; flag, record and move bad ones."""
+
     schedule = load_schedule(CALENDAR_FILE)
     logs_dir = Path(logs_dir)
-    flagged = {}  
-    counts = {}    
-    checked = skipped = 0
+    flagged = {}   # path -> [(label, age, test day, code, problem)]
+    counts = {}    # (kind, test day, label, age) -> number of valid logs
+    checked = skipped = before_start = 0
 
     for path in sorted(logs_dir.glob("*.txt")):
         if not path.is_file():
             continue
-        label = age = test_day = ""
+
+        # Logs from before the calendar existed are not looked at at all.
+        test_day = log_date_from_name(path.name)
+        if test_day and CHECK_FROM and test_day < CHECK_FROM:
+            before_start += 1
+            continue
+
+        label = age = ""
         kind = None
         try:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            test_type = machine_value(lines, 1)   # parameter 0: test name
+            test_type = machine_value(lines, 1)   # parameter 0 - test name
             kind = classify_test(test_type)
             if kind is None:
                 skipped += 1
                 continue
-
-            label = machine_value(lines, 17)      # parameter 16
-            age = machine_value(lines, 9)         # parameter 8
-            match = re.match(r"^(\d{2})_(\d{2})_(\d{4})_", path.name)
-            if not match:
+            if test_day is None:
                 raise ValueError("Unrecognised machine log filename/date")
-            day, month, year = map(int, match.groups())
-            test_day = date(year, month, day)
+
+            label = machine_value(lines, 17)      # parameter 16: e.g. 41-CBTC6D1
+            age = machine_value(lines, 9)         # parameter 8: age in days
             problems = diagnose_concrete(label, age, test_day, schedule)
         except (OSError, ValueError, IndexError) as exc:
             problems = [("", f"Could not read concrete test values: {exc}")]
 
         checked += 1
         if problems:
-            flagged[path] = [(label, age, test_day, code, text) for code, text in problems]
+            flagged[path] = [(label, age, test_day or "", code, text) for code, text in problems]
         else:
             key = (kind, test_day, label.strip().upper(), int(age))
             counts[key] = counts.get(key, 0) + 1
@@ -380,26 +444,33 @@ def check_local_logs(logs_dir=LOGS_DIR):
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     rows = []
     for path, issues in flagged.items():
-        moved_to = move_to_flagged(path)
+        copied_to = copy_to_flagged(path)
         for label, age, test_day, code, problem in issues:
-            name = ERROR_CODES.get(code, "")
-            rows.append((now, str(path), label, age, test_day, code, name, problem, moved_to))
-            shown = f"Error {code} ({name}): {problem}" if code else problem
-            print(f"FLAGGED: {path.name} - {shown}", flush=True)
+            rows.append((
+                now, str(path), label, age, test_day,
+                code, ERROR_CODES.get(code, ""), problem, copied_to,
+            ))
 
     count_issues = check_sample_counts(counts, schedule)
     for label, age, day, problem in count_issues:
         rows.append((now, "", label, age, day, "", "", problem, ""))
-        print(f"COUNT: {problem}", flush=True)
 
-    write_flags(rows, FLAGS_CSV)
+    new_rows = write_flags(rows, FLAGS_CSV)
+    for row in new_rows:
+        if row[1]:
+            shown = f"Error {row[5]} ({row[6]}): {row[7]}" if row[5] else row[7]
+            print(f"FLAGGED: {Path(row[1]).name} - {shown}", flush=True)
+        else:
+            print(f"COUNT: {row[7]}", flush=True)
+
     print(
-        f"Concrete logs checked: {checked}; other logs skipped: {skipped}; "
-        f"files flagged and moved: {len(flagged)}; count problems: {len(count_issues)}",
+        f"Concrete logs checked: {checked}; ignored (before {CHECK_FROM:%d/%m/%Y}): {before_start}; "
+        f"other logs skipped: {skipped}; flagged logs: {len(flagged)}; "
+        f"new problems reported: {len(new_rows)}; count problems: {len(count_issues)}",
         flush=True,
     )
     print(f"Report: {FLAGS_CSV}", flush=True)
-    print(f"Flagged files folder: {FLAGGED_DIR}", flush=True)
+    print(f"Copies of flagged logs: {FLAGGED_DIR}", flush=True)
 
 
 def watch_local_logs(logs_dir=LOGS_DIR):
