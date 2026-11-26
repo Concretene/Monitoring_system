@@ -20,7 +20,6 @@ CALENDAR_FILE = Path(
 SHEET_NAME = "Table_concrete_BM"
 AGES = {
     1: "D1",
-    3: "D3",
     7: "D7",
     14: "D14",
     28: "D28",
